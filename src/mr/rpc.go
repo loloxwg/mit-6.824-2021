@@ -23,7 +23,44 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+type TaskType int
 
+const (
+	Map    TaskType = 1
+	Reduce TaskType = 2
+	Done   TaskType = 3
+)
+
+type GetTaskArgs struct{}
+
+type GetTaskReply struct {
+	TaskType TaskType
+
+	TaskNum int
+
+	NReduceTasks int
+
+	MapFile string
+
+	NMapTasks int
+}
+
+/*
+	FinishedTask RPCs are sent from an idle worker to coordinator to indicate
+	that a task has been completed.
+
+	Alternative designs can also use 'GetTask' RPCs to send the last task
+	the worker finished ,but using a separate RPC makes the design cleaner.
+*/
+type FinishedTaskArgs struct {
+	// what type of task was the worker assigned
+	TaskType TaskType
+	// which task was it
+	TaskNum int
+}
+
+// workers don't need to get a reply
+type FinishedTaskReply struct{}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
