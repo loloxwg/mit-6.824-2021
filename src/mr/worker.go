@@ -1,8 +1,11 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"os"
+	"sort"
 )
 import "log"
 import "net/rpc"
@@ -24,6 +27,28 @@ func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
+}
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
+// rename function
+func finalizeReduceFile(tmpFile string, taskN int) {
+	finalFile := fmt.Sprintf("mr-out-%d", taskN)
+	os.Rename(tmpFile, finalFile)
+}
+func getIntermediateFile(mapTaskN int, redTaskN int) string {
+	return fmt.Sprintf("mr-%d-%d", mapTaskN, redTaskN)
+}
+
+func finalizeIntermediateFile(tmpFile string, mapTaskN int, redTaskN int) {
+	finalFile := getIntermediateFile(mapTaskN, redTaskN)
+	os.Rename(tmpFile, finalFile)
 }
 
 //
@@ -66,11 +91,97 @@ func Worker(mapf func(string, string) []KeyValue,
 }
 
 //preformReduce(reply.TaskNum, reply.NMapTasks, reducef)
-func preformReduce(TaskNum int, NMapTasks int, reducef func(string, []string) string) {
+func preformReduce(taskNum int, NMapTasks int, reducef func(string, []string) string) {
+	kva := []KeyValue{}
+	for m := 0; m < NMapTasks; m++ {
+		iFilename := getIntermediateFile(m, taskNum)
+		file, err := os.Open(iFilename)
+		if err != nil {
+			log.Fatalf("cannot open: %v", iFilename)
+		}
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			kva = append(kva, kv)
+		}
+		file.Close()
+	}
+	//sort keys
+	sort.Sort(ByKey(kva))
+
+	tmpFile, err := ioutil.TempFile("", "")
+	if err != nil {
+		log.Fatal("cannot open temporary file")
+	}
+	tmpFilename := tmpFile.Name()
+	// apply reduce function once to all values of same key
+	key_begin := 0
+	for key_begin < len(kva) {
+		key_end := key_begin + 1
+		for key_end < len(kva) && kva[key_end].Key == kva[key_begin].Key {
+			key_end++
+		}
+		values := []string{}
+		for k := key_begin; k < key_end; k++ {
+			values = append(values, kva[k].Value)
+		}
+		output := reducef(kva[key_begin].Key, values)
+
+		fmt.Fprintf(tmpFile, "%v %v\n", kva[key_begin].Key, output)
+
+		//go to next key
+		key_begin = key_end
+
+	}
+	// automatically rename reduce file to final reduce file
+	finalizeReduceFile(tmpFilename, taskNum)
 
 }
 
 func preformMap(filename string, taskNum int, nReduceTasks int, mapf func(string, string) []KeyValue) {
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatal("cannot open %v", filename)
+		content, err := ioutil.ReadAll(file)
+		if err != nil {
+			log.Fatal("cannot read %v", filename)
+		}
+		file.Close()
+
+		// mapf func(string, string) []KeyValue
+		kva := mapf(filename, string(content))
+
+		// create a tmp filename
+		tmpFiles := []*os.File{}
+		tmpFilesnames := []string{}
+		encoders := []*json.Encoder{}
+		for r := 0; r < nReduceTasks; r++ {
+			tmpFile, err := ioutil.TempFile("", "")
+			if err != nil {
+				log.Fatal("cannot open temp file")
+			}
+			tmpFiles = append(tmpFiles, tmpFile)
+			enc := json.NewEncoder(tmpFile)
+			encoders = append(encoders, enc)
+
+		}
+		//
+		for _, kv := range kva {
+			r := ihash(kv.Key) % nReduceTasks
+			encoders[r].Encode(&kv)
+		}
+
+		for _, f := range tmpFiles {
+			f.Close()
+		}
+		//
+		for r := 0; r < nReduceTasks; r++ {
+			finalizeIntermediateFile(tmpFilesnames[r], taskNum, r)
+		}
+	}
 }
 
 //
