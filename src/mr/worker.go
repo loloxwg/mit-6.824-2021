@@ -48,7 +48,11 @@ func getIntermediateFile(mapTaskN int, redTaskN int) string {
 
 func finalizeIntermediateFile(tmpFile string, mapTaskN int, redTaskN int) {
 	finalFile := getIntermediateFile(mapTaskN, redTaskN)
-	os.Rename(tmpFile, finalFile)
+	err := os.Rename(tmpFile, finalFile)
+	if err != nil {
+		log.Print("rename error")
+		return
+	}
 }
 
 //
@@ -63,7 +67,6 @@ func Worker(mapf func(string, string) []KeyValue,
 		reply := GetTaskReply{}
 		// this will wait until we get assigned a task
 		call("Coordinator.HandlerGetTask", &args, &reply)
-
 		switch reply.TaskType {
 		case Map:
 			preformMap(reply.MapFile, reply.TaskNum, reply.NReduceTasks, mapf)
@@ -97,7 +100,7 @@ func preformReduce(taskNum int, NMapTasks int, reducef func(string, []string) st
 		iFilename := getIntermediateFile(m, taskNum)
 		file, err := os.Open(iFilename)
 		if err != nil {
-			log.Fatalf("cannot open: %v", iFilename)
+			log.Fatalf("cannot open----: %v", iFilename)
 		}
 		dec := json.NewDecoder(file)
 		for {
@@ -141,46 +144,49 @@ func preformReduce(taskNum int, NMapTasks int, reducef func(string, []string) st
 
 }
 
+//  preformMap
 func preformMap(filename string, taskNum int, nReduceTasks int, mapf func(string, string) []KeyValue) {
 	file, err := os.Open(filename)
+	//log.Printf("145# wotker can open %v", filename)
 	if err != nil {
-		log.Fatal("cannot open %v", filename)
-		content, err := ioutil.ReadAll(file)
+		log.Fatal("cannot open %v", filename) //nolint:govet
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatal("cannot read %v", filename) //nolint:govet
+	}
+	file.Close()
+
+	// mapf func(string, string) []KeyValue
+	kva := mapf(filename, string(content))
+
+	// create a tmp filename and encoders each file
+	tmpFiles := []*os.File{}
+	tmpFilenames := []string{}
+	encoders := []*json.Encoder{}
+	for r := 0; r < nReduceTasks; r++ {
+		tmpFile, err := os.CreateTemp("", "")
 		if err != nil {
-			log.Fatal("cannot read %v", filename)
+			log.Fatal("cannot open temp file")
 		}
-		file.Close()
+		tmpFiles = append(tmpFiles, tmpFile)
+		tmpFilename := tmpFile.Name()
+		tmpFilenames = append(tmpFilenames, tmpFilename)
+		enc := json.NewEncoder(tmpFile)
+		encoders = append(encoders, enc)
+	}
+	//
+	for _, kv := range kva {
+		r := ihash(kv.Key) % nReduceTasks
+		encoders[r].Encode(&kv)
+	}
 
-		// mapf func(string, string) []KeyValue
-		kva := mapf(filename, string(content))
-
-		// create a tmp filename
-		tmpFiles := []*os.File{}
-		tmpFilesnames := []string{}
-		encoders := []*json.Encoder{}
-		for r := 0; r < nReduceTasks; r++ {
-			tmpFile, err := ioutil.TempFile("", "")
-			if err != nil {
-				log.Fatal("cannot open temp file")
-			}
-			tmpFiles = append(tmpFiles, tmpFile)
-			enc := json.NewEncoder(tmpFile)
-			encoders = append(encoders, enc)
-
-		}
-		//
-		for _, kv := range kva {
-			r := ihash(kv.Key) % nReduceTasks
-			encoders[r].Encode(&kv)
-		}
-
-		for _, f := range tmpFiles {
-			f.Close()
-		}
-		//
-		for r := 0; r < nReduceTasks; r++ {
-			finalizeIntermediateFile(tmpFilesnames[r], taskNum, r)
-		}
+	for _, f := range tmpFiles {
+		f.Close()
+	}
+	//
+	for r := 0; r < nReduceTasks; r++ {
+		finalizeIntermediateFile(tmpFilenames[r], taskNum, r)
 	}
 }
 
