@@ -58,50 +58,101 @@ func finalizeIntermediateFile(tmpFile string, mapTaskN int, redTaskN int) {
 //
 // main/mrworker.go calls this function.
 //
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
+func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
 
-	// Your worker implementation here.
 	for {
-		args := GetTaskArgs{}
-		reply := GetTaskReply{}
-		// this will wait until we get assigned a task
-		call("Coordinator.HandlerGetTask", &args, &reply)
-		switch reply.TaskType {
+		ok, res := GetMapTask()
+		if !ok || res.Finished {
+			break
+		}
+
+		// Wait if master is waiting for all files to be mapped
+		if res.Empty {
+			continue
+		}
+
+		args := &CommitArgs{}
+		args.Type = res.Type
+		args.ID = res.Index
+
+		switch res.Type {
 		case Map:
-			preformMap(reply.MapFile, reply.TaskNum, reply.NReduceTasks, mapf)
+			if err := mapping(mapf, res.Filename, res.NReduce, res.Index); err != nil {
+				log.Fatal(err)
+			}
 		case Reduce:
-			preformReduce(reply.TaskNum, reply.NMapTasks, reducef)
-		case Done:
-			// there are no more tasks remaining, let's exit
-			os.Exit(0)
-		default:
-			fmt.Errorf("Bad task type? %s", reply.TaskType)
+			if err := reducing(reducef, res.NReduce, res.Index); err != nil {
+				log.Fatal(err)
+			}
 		}
-
-		// tell coordinator that we're done
-		finargs := FinishedTaskArgs{
-			TaskType: reply.TaskType,
-			TaskNum:  reply.TaskNum,
-		}
-		finreply := FinishedTaskReply{}
-		call("Coordinator.HandlerFinishedTask", &finargs, &finreply)
-
+		commit(args)
 	}
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
-
 }
 
-//preformReduce(reply.TaskNum, reply.NMapTasks, reducef)
-func preformReduce(taskNum int, NMapTasks int, reducef func(string, []string) string) {
-	kva := []KeyValue{}
-	for m := 0; m < NMapTasks; m++ {
-		iFilename := getIntermediateFile(m, taskNum)
-		file, err := os.Open(iFilename)
+func commit(args *CommitArgs) {
+	replys := CommitReply{}
+
+	call("Coordinator.Commit", &args, &replys)
+}
+
+func mapping(mapf func(string, string) []KeyValue, filename string, nReduce, index int) error {
+	file, err := os.Open(filename)
+	if err != nil {
+		return fmt.Errorf("cannot open %v", filename)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		return fmt.Errorf("cannot read %v", filename)
+	}
+	file.Close()
+	kva := mapf(filename, string(content))
+
+	sort.Sort(ByKey(kva))
+
+	var fileBucket = make(map[int]*json.Encoder)
+	for i := 0; i < nReduce; i++ {
+		oname := fmt.Sprintf("mr-%d-%d", index, i)
+		ofile, _ := os.Create(oname)
+
+		fileBucket[i] = json.NewEncoder(ofile)
+		defer ofile.Close()
+	}
+
+	for _, v := range kva {
+		reduceID := ihash(v.Key) % nReduce
+
+		// 写入文件 mr-X-Y 中
+		enc := fileBucket[reduceID]
+		err := enc.Encode(&v)
 		if err != nil {
-			log.Fatalf("cannot open----: %v", iFilename)
+			return err
 		}
+	}
+
+	return nil
+}
+
+// GetMapTask ...
+func GetMapTask() (bool, *AssignReply) {
+	args := AssignArgs{}
+
+	replys := AssignReply{}
+
+	if !call("Coordinator.Assign", &args, &replys) {
+		return false, nil
+	}
+
+	return true, &replys
+}
+
+func reducing(reducef func(string, []string) string, nReduce, index int) error {
+
+	kva := make([]KeyValue, 0)
+	for i := 0; i < nReduce; i++ {
+		filename := fmt.Sprintf("mr-%d-%d", i, index)
+
+		file, _ := os.Open(filename)
+
 		dec := json.NewDecoder(file)
 		for {
 			var kv KeyValue
@@ -110,84 +161,32 @@ func preformReduce(taskNum int, NMapTasks int, reducef func(string, []string) st
 			}
 			kva = append(kva, kv)
 		}
-		file.Close()
 	}
-	//sort keys
+
 	sort.Sort(ByKey(kva))
 
-	tmpFile, err := ioutil.TempFile("", "")
-	if err != nil {
-		log.Fatal("cannot open temporary file")
-	}
-	tmpFilename := tmpFile.Name()
-	// apply reduce function once to all values of same key
-	key_begin := 0
-	for key_begin < len(kva) {
-		key_end := key_begin + 1
-		for key_end < len(kva) && kva[key_end].Key == kva[key_begin].Key {
-			key_end++
+	outFilename := fmt.Sprintf("mr-out-%d", index)
+	ofile, _ := os.Create(outFilename)
+
+	i := 0
+	for i < len(kva) {
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
 		}
 		values := []string{}
-		for k := key_begin; k < key_end; k++ {
+		for k := i; k < j; k++ {
 			values = append(values, kva[k].Value)
 		}
-		output := reducef(kva[key_begin].Key, values)
+		output := reducef(kva[i].Key, values)
 
-		fmt.Fprintf(tmpFile, "%v %v\n", kva[key_begin].Key, output)
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
 
-		//go to next key
-		key_begin = key_end
-
-	}
-	// automatically rename reduce file to final reduce file
-	finalizeReduceFile(tmpFilename, taskNum)
-
-}
-
-//  preformMap
-func preformMap(filename string, taskNum int, nReduceTasks int, mapf func(string, string) []KeyValue) {
-	file, err := os.Open(filename)
-	//log.Printf("145# wotker can open %v", filename)
-	if err != nil {
-		log.Fatal("cannot open %v", filename) //nolint:govet
-	}
-	content, err := ioutil.ReadAll(file)
-	if err != nil {
-		log.Fatal("cannot read %v", filename) //nolint:govet
-	}
-	file.Close()
-
-	// mapf func(string, string) []KeyValue
-	kva := mapf(filename, string(content))
-
-	// create a tmp filename and encoders each file
-	tmpFiles := []*os.File{}
-	tmpFilenames := []string{}
-	encoders := []*json.Encoder{}
-	for r := 0; r < nReduceTasks; r++ {
-		tmpFile, err := os.CreateTemp("", "")
-		if err != nil {
-			log.Fatal("cannot open temp file")
-		}
-		tmpFiles = append(tmpFiles, tmpFile)
-		tmpFilename := tmpFile.Name()
-		tmpFilenames = append(tmpFilenames, tmpFilename)
-		enc := json.NewEncoder(tmpFile)
-		encoders = append(encoders, enc)
-	}
-	//
-	for _, kv := range kva {
-		r := ihash(kv.Key) % nReduceTasks
-		encoders[r].Encode(&kv)
+		i = j
 	}
 
-	for _, f := range tmpFiles {
-		f.Close()
-	}
-	//
-	for r := 0; r < nReduceTasks; r++ {
-		finalizeIntermediateFile(tmpFilenames[r], taskNum, r)
-	}
+	return nil
 }
 
 //
